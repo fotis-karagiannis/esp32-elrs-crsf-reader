@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ELRS CRSF Reader</title>
+<style>
+    body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #0d0d0f;
+        color: #e0e0e0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 20px;
+    }
+
+    h1 {
+        color: #00ffc8;
+        margin-bottom: 10px;
+        font-weight: 300;
+        letter-spacing: 1px;
+    }
+
+    #connectBtn, #nextBtn {
+        background: #00ffc8;
+        color: #000;
+        border: none;
+        padding: 12px 24px;
+        font-size: 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        margin-top: 10px;
+        transition: 0.2s;
+    }
+
+    #connectBtn:hover, #nextBtn:hover {
+        background: #00d9aa;
+    }
+
+    #status {
+        margin-top: 10px;
+        font-size: 14px;
+        color: #888;
+    }
+
+    #instructionBox {
+        margin-top: 30px;
+        padding: 20px;
+        background: #141418;
+        border: 1px solid #00ffc8;
+        border-radius: 8px;
+        width: 600px;
+        text-align: center;
+        font-size: 20px;
+        display: none;
+    }
+
+    #channels {
+        margin-top: 30px;
+        width: 600px;
+        display: none;
+    }
+
+    .channelRow {
+        display: flex;
+        align-items: center;
+        margin-bottom: 8px;
+    }
+
+    .channelLabel {
+        width: 50px;
+        font-size: 14px;
+        color: #aaa;
+    }
+
+    .barContainer {
+        flex: 1;
+        height: 12px;
+        background: #1e1e24;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+
+    .barFill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #00ffc8, #00aaff);
+        transition: width 0.05s linear;
+    }
+
+    #nextBtn {
+        margin-top: 20px;
+        display: none;
+    }
+
+    #results {
+        margin-top: 40px;
+        width: 600px;
+        display: none;
+        background: #141418;
+        padding: 20px;
+        border-radius: 8px;
+        border: 1px solid #00ffc8;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+    }
+
+    th, td {
+        padding: 8px;
+        border-bottom: 1px solid #333;
+        text-align: left;
+    }
+
+    th {
+        color: #00ffc8;
+    }
+</style>
+</head>
+<body>
+
+<h1>ELRS CRSF Reader</h1>
+
+<button id="connectBtn">Connect to Device</button>
+<div id="status">Not connected</div>
+
+<div id="instructionBox"></div>
+
+<div id="channels"></div>
+
+<button id="nextBtn">Next</button>
+
+<div id="results"></div>
+
+<script>
+let port;
+let reader;
+let writer;
+let textDecoder = new TextDecoder();
+let textEncoder = new TextEncoder();
+
+let channelBars = [];
+let readBuffer = "";
+
+let readyRetryTimer = null;
+let readingStarted = false;
+
+// === CONNECT ===
+async function connectSerial() {
+    try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        writer = port.writable.getWriter();
+        reader = port.readable.getReader();
+
+        document.getElementById("status").innerText = "Connected";
+        document.getElementById("instructionBox").style.display = "block";
+        document.getElementById("channels").style.display = "block";
+
+        initChannelBars();
+        listenSerial();
+
+        // Opening the serial port may reset some ESP32 boards.
+        // Give the ESP32 time to boot, then retry ACK:READY until
+        // the first STEP response confirms that reading has started.
+        startReadyHandshake();
+
+    } catch (err) {
+        document.getElementById("status").innerText = "Connection failed";
+    }
+}
+
+// === CHANNEL BAR SETUP ===
+function initChannelBars() {
+    const container = document.getElementById("channels");
+    container.innerHTML = "";
+
+    for (let i = 1; i <= 16; i++) {
+        const row = document.createElement("div");
+        row.className = "channelRow";
+
+        const label = document.createElement("div");
+        label.className = "channelLabel";
+        label.innerText = "CH" + i;
+
+        const barContainer = document.createElement("div");
+        barContainer.className = "barContainer";
+
+        const barFill = document.createElement("div");
+        barFill.className = "barFill";
+
+        barContainer.appendChild(barFill);
+        row.appendChild(label);
+        row.appendChild(barContainer);
+        container.appendChild(row);
+
+        channelBars[i] = barFill;
+    }
+}
+
+// === STARTUP HANDSHAKE ===
+function startReadyHandshake() {
+    readingStarted = false;
+
+    if (readyRetryTimer !== null) {
+        clearInterval(readyRetryTimer);
+        readyRetryTimer = null;
+    }
+
+    setTimeout(() => {
+        if (readingStarted || !writer) {
+            return;
+        }
+
+        sendACK("READY");
+
+        readyRetryTimer = setInterval(() => {
+            if (readingStarted || !writer) {
+                clearInterval(readyRetryTimer);
+                readyRetryTimer = null;
+                return;
+            }
+
+            sendACK("READY");
+        }, 1000);
+    }, 1500);
+}
+
+function stopReadyHandshake() {
+    readingStarted = true;
+
+    if (readyRetryTimer !== null) {
+        clearInterval(readyRetryTimer);
+        readyRetryTimer = null;
+    }
+}
+
+// === SERIAL LISTENER WITH LINE BUFFER ===
+async function listenSerial() {
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        const chunk = textDecoder.decode(value);
+        readBuffer += chunk;
+
+        let lines = readBuffer.split("\n");
+        readBuffer = lines.pop();
+
+        for (let line of lines) {
+            if (line.trim().length > 0) {
+                handleSerialInput(line.trim());
+            }
+        }
+    }
+}
+
+// === PARSE INCOMING LINES ===
+function handleSerialInput(line) {
+
+    if (line.startsWith("STEP:")) {
+        stopReadyHandshake();
+
+        const step = line.substring(5);
+        document.getElementById("instructionBox").innerText = step.replace(/_/g, " ");
+        document.getElementById("nextBtn").style.display = "block";
+    }
+
+    if (line.startsWith("DATA:")) {
+        const data = line.substring(5).split(",");
+        data.forEach(pair => {
+            const [ch, val] = pair.split("=");
+            const chNum = parseInt(ch.replace("CH", ""));
+            const v = parseInt(val);
+            const pct = (v - 172) / (1811 - 172) * 100;
+            if (channelBars[chNum]) {
+                channelBars[chNum].style.width = Math.max(0, Math.min(100, pct)) + "%";
+            }
+        });
+    }
+
+    if (line.startsWith("RESULT:")) {
+        const resultsBox = document.getElementById("results");
+        resultsBox.style.display = "block";
+
+        if (!resultsBox.innerHTML.includes("<table>")) {
+            resultsBox.innerHTML = "<h2>Results</h2><table><tr><th>Channel</th><th>Function</th><th>Min</th><th>Mid</th><th>Max</th></tr></table>";
+        }
+
+        const table = resultsBox.querySelector("table");
+        const parts = line.substring(7).split(",");
+        const row = document.createElement("tr");
+
+        let ordered = ["CH", "FUNC", "MIN", "MID", "MAX"];
+        let map = {};
+        parts.forEach(p => {
+            const [k, v] = p.split("=");
+            map[k] = v;
+        });
+
+        ordered.forEach(key => {
+            const cell = document.createElement("td");
+            cell.innerText = map[key] !== undefined ? map[key] : "";
+            row.appendChild(cell);
+        });
+
+        table.appendChild(row);
+    }
+
+    if (line.startsWith("DONE")) {
+        document.getElementById("instructionBox").innerText = "Reading Complete!";
+        document.getElementById("nextBtn").style.display = "none";
+    }
+}
+
+// === SEND ACK ===
+function sendACK(msg) {
+    writer.write(textEncoder.encode("ACK:" + msg + "\n"));
+}
+
+document.getElementById("connectBtn").onclick = connectSerial;
+document.getElementById("nextBtn").onclick = () => sendACK("NEXT");
+</script>
+
+</body>
+</html>
