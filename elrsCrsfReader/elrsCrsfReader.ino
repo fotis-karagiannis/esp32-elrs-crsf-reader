@@ -57,15 +57,21 @@ void resetStepTracking() {
 // CRSF frame parsing
 // Extracts one packed 11-bit RC channel value from the CRSF payload.
 uint16_t getChannel(const uint8_t *payload, int payloadLen, int ch) {
+  if (ch < 0 || ch >= 16 || payloadLen <= 0) return 0;
+
   int bitIndex  = ch * 11;
   int byteIndex = bitIndex / 8;
   int bitOffset = bitIndex % 8;
 
-  if (byteIndex < 0 || byteIndex + 2 >= payloadLen) return 0;
+  // An 11-bit channel can span two or three payload bytes. Channel 16 starts
+  // at bit 5 of byte 20 and ends in byte 21, so only two bytes remain there.
+  int bytesNeeded = (bitOffset + 11 + 7) / 8;
+  if (byteIndex + bytesNeeded > payloadLen) return 0;
 
-  uint32_t value = payload[byteIndex]
-                 | (uint32_t)payload[byteIndex + 1] << 8
-                 | (uint32_t)payload[byteIndex + 2] << 16;
+  uint32_t value = 0;
+  for (int i = 0; i < bytesNeeded; i++) {
+    value |= (uint32_t)payload[byteIndex + i] << (8 * i);
+  }
 
   return (value >> bitOffset) & 0x07FF;
 }
@@ -90,8 +96,8 @@ bool readCRSF() {
       if (idx == frameSize) {
         uint8_t type = buf[2];
 
-        if (type != 0x16) { idx = 0; return true; }
-        if (len < 24)     { idx = 0; return true; }
+        if (type != 0x16) { idx = 0; continue; }
+        if (len < 24)     { idx = 0; continue; }
 
         const uint8_t *payload = &buf[3];
         int payloadLen = len - 2;
@@ -138,6 +144,23 @@ int extraIndex = 0;
 // Results are stored until reading is complete, then sorted by channel.
 AxisData results[32];
 int resultCount = 0;
+
+// Clears all values collected by a previous reading session while preserving
+// the current live CRSF channel values.
+void resetReadingSession() {
+  throttleData = AxisData();
+  rollData     = AxisData();
+  pitchData    = AxisData();
+  yawData      = AxisData();
+  armData      = AxisData();
+
+  armCh = -1;
+  extraCount = 0;
+  extraIndex = 0;
+  resultCount = 0;
+
+  resetStepTracking();
+}
 
 // Browser serial protocol helpers
 /*
@@ -269,8 +292,8 @@ void handleUICommand(String cmd) {
   const int BUTTON_THRESHOLD = 20;
 
   if (cmd.startsWith("ACK:READY")) {
+    resetReadingSession();
     state = THR_UP;
-    resetStepTracking();
     sendStep("THROTTLE_UP");
   }
 
@@ -288,6 +311,12 @@ void handleUICommand(String cmd) {
             bestDelta = delta;
             bestCh = i;
           }
+        }
+
+        if (bestCh == -1) {
+          resetStepTracking();
+          sendStep("THROTTLE_UP");
+          break;
         }
 
         throttleData.ch  = bestCh;
@@ -327,6 +356,12 @@ void handleUICommand(String cmd) {
           }
         }
 
+        if (bestCh == -1) {
+          resetStepTracking();
+          sendStep("ROLL_LEFT");
+          break;
+        }
+
         rollData.ch  = bestCh;
         rollData.min = stepMin[bestCh];
         rollData.max = stepMax[bestCh];
@@ -364,6 +399,12 @@ void handleUICommand(String cmd) {
           }
         }
 
+        if (bestCh == -1) {
+          resetStepTracking();
+          sendStep("PITCH_UP");
+          break;
+        }
+
         pitchData.ch  = bestCh;
         pitchData.max = stepMax[bestCh];
         pitchData.min = stepMin[bestCh];
@@ -399,6 +440,12 @@ void handleUICommand(String cmd) {
             bestDelta = delta;
             bestCh = i;
           }
+        }
+
+        if (bestCh == -1) {
+          resetStepTracking();
+          sendStep("YAW_LEFT");
+          break;
         }
 
         yawData.ch  = bestCh;
